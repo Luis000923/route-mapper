@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "route-mapper"
+version = "1.0.0"
+description = "Crawler que mapea las rutas internas de un sitio web."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["crawler", "recon", "route-mapper", "sitemap", "web"]
+authors = [{ name = "cruncron", email = "cruncron@gmail.com" }]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/cruncron/route-mapper"
+Issues = "https://github.com/cruncron/route-mapper/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+route-mapper = "route_mapper.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/route_mapper"]
+
+[tool.ruff]
+src = ["src", "tests"]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "S", "I", "UP", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+files = ["src", "tests"]
