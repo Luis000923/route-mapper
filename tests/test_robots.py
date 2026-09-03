@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import urllib.error
+from collections.abc import Callable
 from typing import Any
 
 from route_mapper.robots import _MAX_ROBOTS_BYTES, RobotsPolicy
@@ -27,7 +28,7 @@ class _FakeResponse(io.BytesIO):
 class _FakeOpener:
     """Sustituye a ``build_opener`` para no tocar la red en tests."""
 
-    def __init__(self, handler: Any) -> None:
+    def __init__(self, handler: Callable[[str], _FakeResponse]) -> None:
         self.opened: list[str] = []
         self._handler = handler
 
