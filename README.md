@@ -4,7 +4,7 @@ Crawler modular en Python para mapear las rutas internas de un sitio web y
 detectar enlaces rotos. Recorre un dominio a partir de una URL inicial, sigue
 solo los enlaces internos y genera un reporte con el estado de cada ruta.
 
-## Caracteristicas
+## Características
 
 - Rastreo limitado por numero de paginas y por profundidad de enlaces.
 - Respeta `robots.txt` (se puede desactivar).
@@ -19,7 +19,7 @@ solo los enlaces internos y genera un reporte con el estado de cada ruta.
 - Python 3.10 o superior.
 - [uv](https://docs.astral.sh/uv/) para gestionar el entorno y las dependencias.
 
-## Instalacion
+## Instalación
 
 ```bash
 uv sync
@@ -49,6 +49,20 @@ uv run python -m route_mapper https://example.com
 | `-t`, `--timeout` | Timeout por peticion en segundos | 10 |
 | `-c`, `--concurrency` | Peticiones en paralelo | 1 |
 | `--retries` | Reintentos ante fallos de red | 2 |
+| `--max-redirects` | Redirecciones máximas por petición | 5 |
+| `--global-timeout` | Tiempo máximo total del crawl en segundos | 300 |
+| `--max-links-per-page` | Enlaces máximos extraídos por página | 1000 |
+| `-H`, `--header` | Cabecera HTTP personalizada `Nombre: Valor` (repetible) | - |
+| `--login-url` | URL del formulario/endpoint de login (activa la autenticación previa) | - |
+| `--login-user` / `--login-pass` | Credenciales para el login (obligatorias con `--login-url`) | - |
+| `--user-field` / `--pass-field` | Nombre de los campos de usuario/contraseña en el formulario o JSON | `username` / `password` |
+| `--auth-type` | Tipo de autenticación: `form` o `json` | `form` |
+| `--token-key` | Clave del token en la respuesta JSON → `Authorization: Bearer <token>` | - |
+| `--proxy` | Canaliza todo el tráfico por un proxy `http(s)://` o `socks5(h)://` (Burp, Tor) | - |
+| `--ua-file` | Archivo con User-Agents (uno por línea) para rotación aleatoria por petición | - |
+| `--jitter` | Variación aleatoria ±segundos sobre la pausa entre lotes | 0 |
+| `--sitemap` | Siembra la cola con las URLs declaradas en `/sitemap.xml` | desactivado |
+| `--parse-js` / `--no-parse-js` | Minado de endpoints (`/api/...`, `/admin/...`) en archivos `.js` | activado |
 | `--include-subdomains` | Seguir enlaces a subdominios del mismo dominio | desactivado |
 | `--ignore-robots` | No respetar `robots.txt` | desactivado |
 | `-f`, `--format` | Formato del reporte (`txt`, `json`, `csv`, `html`) | `txt` |
@@ -64,6 +78,29 @@ uv run route-mapper https://example.com -m 200 -f html -o reporte.html
 
 # Rastreo rapido con 4 peticiones en paralelo y sin robots.txt
 uv run route-mapper https://example.com -c 4 --ignore-robots
+
+# A traves de Burp, rotando User-Agent y con jitter para difuminar el patron
+uv run route-mapper https://example.com \
+  --proxy http://127.0.0.1:8080 --ua-file agents.txt --jitter 0.5
+
+# Sembrar desde sitemap.xml y minar endpoints de los .js descubiertos
+uv run route-mapper https://example.com --sitemap --parse-js
+
+# Escaneo autenticado enviando cabeceras personalizadas
+uv run route-mapper https://example.com \
+  -H "Authorization: Bearer eyJhbGci..." \
+  -H "Cookie: session=abc123"
+
+# Login por formulario: el crawler obtiene la cookie de sesión y la reutiliza
+uv run route-mapper https://example.com \
+  --login-url https://example.com/login \
+  --login-user admin --login-pass 's3cret'
+
+# Login JSON/API: extrae el token del cuerpo de la respuesta
+uv run route-mapper https://example.com \
+  --login-url https://example.com/api/auth \
+  --login-user admin --login-pass 's3cret' \
+  --auth-type json --token-key access_token
 ```
 
 ### Codigos de salida

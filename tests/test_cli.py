@@ -97,6 +97,53 @@ def test_progress_hook_logs_each_page(
     assert any("[0001]" in r.getMessage() for r in caplog.records)
 
 
+def test_cli_parses_custom_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, CrawlConfig] = {}
+
+    def _run(self: Crawler) -> CrawlResult:
+        captured["config"] = self._config
+        return _fake_result()
+
+    monkeypatch.setattr(Crawler, "run", _run)
+    code = main([
+        "https://example.com", "-q", "-o", "/dev/null",
+        "-H", "Authorization: Bearer token123",
+        "-H", "User-Agent: CustomBot",
+    ])
+    assert code == 0
+    assert captured["config"].extra_headers == {
+        "Authorization": "Bearer token123",
+        "User-Agent": "CustomBot",
+    }
+
+
+def test_cli_malformed_header_is_usage_error() -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["https://example.com", "-H", "CabeceraInvalidaSinPuntos"])
+    assert exc.value.code == 2
+
+
+def test_cli_parses_redirect_and_timeout_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, CrawlConfig] = {}
+
+    def _run(self: Crawler) -> CrawlResult:
+        captured["config"] = self._config
+        return _fake_result()
+
+    monkeypatch.setattr(Crawler, "run", _run)
+    code = main([
+        "https://example.com", "-q", "-o", "/dev/null",
+        "--max-redirects", "9", "--global-timeout", "42.5",
+        "--max-links-per-page", "50",
+    ])
+    assert code == 0
+    assert captured["config"].max_redirects == 9
+    assert captured["config"].global_timeout == 42.5
+    assert captured["config"].max_links_per_page == 50
+
+
 def test_safe_dump_masks_sensitive_headers() -> None:
     config = CrawlConfig(
         start_url="https://example.com",

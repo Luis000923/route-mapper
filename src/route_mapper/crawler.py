@@ -8,6 +8,7 @@ la presentación quede desacoplada.
 from __future__ import annotations
 
 import logging
+import random
 import time
 from collections import deque
 from collections.abc import Callable
@@ -16,8 +17,9 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
+from route_mapper.auth import authenticate
 from route_mapper.config import CrawlConfig
-from route_mapper.http_client import HttpClient, UrllibHttpClient
+from route_mapper.http_client import AuthHttpClient, HttpClient, UrllibHttpClient
 from route_mapper.models import (
     CrawlResult,
     ExecutionMetadata,
@@ -25,10 +27,10 @@ from route_mapper.models import (
     FetchResponse,
     PageRecord,
 )
-from route_mapper.parser import extract_links
+from route_mapper.parser import extract_js_endpoints, extract_links, parse_sitemap
 from route_mapper.robots import RobotsPolicy
 from route_mapper.scope import ScopeEngine
-from route_mapper.url_utils import in_scope, normalize_url
+from route_mapper.url_utils import in_scope, normalize_url, resolve_link
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +60,7 @@ class Crawler:
             user_agent=config.user_agent,
             enabled=config.respect_robots,
             timeout=config.timeout,
+            scope=self._scope,
         )
         self._on_page = on_page
 
@@ -74,9 +77,15 @@ class Crawler:
             config=self._config.safe_dump(),
         )
 
+        if self._config.auth is not None:
+            self._run_authentication()
+
         # frontier: (url, depth, referrer)
         frontier: deque[tuple[str, int, str | None]] = deque([(start, 0, None)])
         seen: set[str] = {start}
+
+        if self._config.sitemap:
+            self._seed_from_sitemap(start, root_host, frontier, seen)
 
         start_time = time.monotonic()
         timed_out = False
@@ -87,6 +96,7 @@ class Crawler:
                     timed_out = True
                     break
                 batch = self._take_batch(frontier, result)
+                effective_delay = self._effective_delay(batch)
                 futures: dict[Future[FetchResponse], tuple[str, int, str | None]] = {}
 
                 for url, depth, referrer in batch:
@@ -134,8 +144,8 @@ class Crawler:
                 if timed_out:
                     break
 
-                if self._config.delay:
-                    time.sleep(self._config.delay)
+                if effective_delay:
+                    time.sleep(effective_delay)
 
         if timed_out:
             log.warning(
@@ -149,6 +159,23 @@ class Crawler:
         log.info("crawl terminado: %s", result.summary())
         return result
 
+    def _run_authentication(self) -> None:
+        """Ejecuta el login y fusiona la sesión en las cabeceras globales.
+
+        Se apoya en el mismo cliente HTTP del crawl (que debe exponer ``post``);
+        las cookies/tokens resultantes se inyectan en ``config.extra_headers``
+        para que todas las peticiones posteriores naveguen autenticadas.
+        """
+        auth = self._config.auth
+        if auth is None:  # pragma: no cover - lo garantiza el llamador
+            return
+        if not isinstance(self._http, AuthHttpClient):
+            raise TypeError(
+                "el cliente HTTP inyectado no soporta autenticación (falta post())"
+            )
+        session_headers = authenticate(auth, self._http, self._scope)
+        self._config.extra_headers.update(session_headers)
+
     # -- helpers ---------------------------------------------------------------
 
     def _take_batch(
@@ -159,6 +186,68 @@ class Crawler:
         room = self._config.max_pages - len(result.pages)
         size = max(1, min(self._config.concurrency, room, len(frontier)))
         return [frontier.popleft() for _ in range(size)]
+
+    def _effective_delay(
+        self, batch: list[tuple[str, int, str | None]]
+    ) -> float:
+        """Pausa de cortesía a aplicar tras procesar ``batch``.
+
+        Es el máximo entre ``config.delay`` y el mayor ``Crawl-delay`` declarado
+        en ``robots.txt`` para las URLs del lote. Con ``--ignore-robots`` la
+        directiva se omite y prevalece ``config.delay``.
+        """
+        delay = self._config.delay
+        for url, _depth, _referrer in batch:
+            robots_delay = self._robots.crawl_delay(url)
+            if robots_delay is not None and robots_delay > delay:
+                delay = robots_delay
+        if self._config.jitter > 0:
+            # delay ± uniform(0, jitter), recortado a [0, +inf).
+            jitter = random.uniform(-self._config.jitter, self._config.jitter)  # noqa: S311
+            delay = max(0.0, delay + jitter)
+        return delay
+
+    def _seed_from_sitemap(
+        self,
+        start: str,
+        root_host: str,
+        frontier: deque[tuple[str, int, str | None]],
+        seen: set[str],
+    ) -> None:
+        """Descarga ``/sitemap.xml`` y siembra la cola con sus ``<loc>`` en scope.
+
+        Cada URL se normaliza y se filtra por política de dominio antes de
+        encolarse; la revalidación IP/SSRF la aplica la capa HTTP al visitarla.
+        Cualquier fallo (red, XML inválido, DTD) se degrada a "sin semillas".
+        """
+        sitemap_url = resolve_link(start, "/sitemap.xml")
+        if sitemap_url is None:
+            return
+        response = self._http.get(sitemap_url)
+        if response.outcome is not FetchOutcome.OK or not response.body:
+            log.info("sitemap.xml no disponible (%s)", response.outcome.value)
+            return
+        try:
+            text = response.body.decode(response.charset or "utf-8", errors="replace")
+        except LookupError:
+            text = response.body.decode("utf-8", errors="replace")
+
+        added = 0
+        limit = self._config.max_queued_urls
+        for loc in parse_sitemap(text):
+            normalized = normalize_url(loc)
+            if normalized is None or normalized in seen:
+                continue
+            if not in_scope(
+                normalized, root_host, include_subdomains=self._config.include_subdomains
+            ):
+                continue
+            if len(seen) >= limit or len(frontier) >= limit:
+                break
+            seen.add(normalized)
+            frontier.append((normalized, 0, sitemap_url))
+            added += 1
+        log.info("sitemap.xml: %d URLs sembradas en la cola", added)
 
     def _record(
         self,
@@ -188,7 +277,17 @@ class Crawler:
         frontier: deque[tuple[str, int, str | None]],
         result: CrawlResult,
     ) -> None:
-        if response.outcome is not FetchOutcome.OK or not response.is_html:
+        if response.outcome is not FetchOutcome.OK:
+            return
+
+        if response.is_javascript:
+            if self._config.parse_js:
+                self._enqueue_js_endpoints(
+                    response, depth, root_host, seen, frontier, result
+                )
+            return
+
+        if not response.is_html:
             return
 
         at_max_depth = (
@@ -217,6 +316,40 @@ class Crawler:
                 continue
             # Cota de memoria global: si las colas llegan al límite dejamos de
             # encolar para esta página (protección anti-OOM ante URLs infinitas).
+            if len(seen) >= limit or len(frontier) >= limit:
+                break
+            seen.add(link)
+            frontier.append((link, depth + 1, response.url))
+
+    def _enqueue_js_endpoints(
+        self,
+        response: FetchResponse,
+        depth: int,
+        root_host: str,
+        seen: set[str],
+        frontier: deque[tuple[str, int, str | None]],
+        result: CrawlResult,
+    ) -> None:
+        """Mina rutas del cuerpo JS y las encola tras validarlas contra el scope."""
+        at_max_depth = (
+            self._config.max_depth is not None and depth >= self._config.max_depth
+        )
+        text = response.body.decode(response.charset or "utf-8", errors="replace")
+        raw = sorted(extract_js_endpoints(text))[: self._config.max_links_per_page]
+
+        limit = self._config.max_queued_urls
+        for path in raw:
+            link = resolve_link(response.url, path)
+            if link is None:
+                continue
+            if not in_scope(
+                link, root_host, include_subdomains=self._config.include_subdomains
+            ):
+                continue
+            if link != response.url:
+                result.edges.add((response.url, link))
+            if link in seen or at_max_depth:
+                continue
             if len(seen) >= limit or len(frontier) >= limit:
                 break
             seen.add(link)

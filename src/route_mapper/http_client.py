@@ -21,13 +21,19 @@ import socket
 import ssl
 import time
 from http.client import HTTPMessage
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import (
+    BaseHandler,
+    HTTPRedirectHandler,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
 
 from route_mapper.config import CrawlConfig
-from route_mapper.models import FetchOutcome, FetchResponse
+from route_mapper.models import FetchOutcome, FetchResponse, HttpPostResult
 from route_mapper.scope import ScopeEngine, ScopeViolation, SsrfViolation
 from route_mapper.url_utils import normalize_url, resolve_link
 
@@ -59,6 +65,22 @@ class HttpClient(Protocol):
     def get(self, url: str) -> FetchResponse: ...
 
 
+@runtime_checkable
+class AuthHttpClient(Protocol):
+    """Subconjunto de la capa HTTP que necesita el flujo de autenticación."""
+
+    def post(
+        self, url: str, *, data: bytes, content_type: str
+    ) -> HttpPostResult: ...
+
+
+class HttpAuthError(Exception):
+    """Fallo de red o de protocolo durante una petición ``POST`` de login.
+
+    El mensaje nunca incluye el cuerpo de la petición (que lleva credenciales).
+    """
+
+
 class _NoRedirectHandler(HTTPRedirectHandler):
     """Neutraliza el seguimiento automático: todo ``3xx`` sale como ``HTTPError``."""
 
@@ -77,13 +99,18 @@ class _NoRedirectHandler(HTTPRedirectHandler):
 class UrllibHttpClient:
     """Implementación por defecto basada en la stdlib."""
 
-    def __init__(self, config: CrawlConfig, scope: ScopeEngine | None = None) -> None:
+    def __init__(self, config: CrawlConfig, *, scope: ScopeEngine) -> None:
         self._config = config
-        if scope is None:
-            root = urlparse(normalize_url(config.start_url) or config.start_url).hostname or ""
-            scope = ScopeEngine(root, include_subdomains=config.include_subdomains)
         self._scope = scope
-        self._opener = build_opener(_NoRedirectHandler)
+        handlers: list[BaseHandler | type[BaseHandler]] = [_NoRedirectHandler]
+        if config.proxy:
+            # ``ProxyHandler`` canaliza http/https por el proxy indicado. La
+            # revalidación anti-SSRF sobre el host destino (``assert_ip_allowed``)
+            # se mantiene: nunca se delega la política de scope al proxy.
+            handlers.append(
+                ProxyHandler({"http": config.proxy, "https": config.proxy})
+            )
+        self._opener = build_opener(*handlers)
 
     def get(self, url: str) -> FetchResponse:
         redirects_left = self._config.max_redirects
@@ -121,6 +148,79 @@ class UrllibHttpClient:
             redirects_left -= 1
             current = redirect_to
 
+    def post(
+        self, url: str, *, data: bytes, content_type: str
+    ) -> HttpPostResult:
+        """Envía un ``POST`` siguiendo redirecciones de forma segura.
+
+        Cada salto ``3xx`` se revalida contra el motor de scope + SSRF y las
+        cookies (``Set-Cookie``) de todos los saltos se acumulan. Nunca se
+        reintenta ni se registra ``data`` (contiene credenciales).
+        """
+        cookies: list[str] = []
+        current = normalize_url(url) or url
+        method = "POST"
+        payload: bytes | None = data
+        headers = {**self._config.request_headers(), "Content-Type": content_type}
+        redirects_left = self._config.max_redirects
+
+        while True:
+            host = urlparse(current).hostname or ""
+            try:
+                self._scope.assert_ip_allowed(host)
+                request = Request(  # noqa: S310 - esquema validado en normalize_url
+                    current, data=payload, headers=headers, method=method
+                )
+                with self._opener.open(
+                    request, timeout=self._config.timeout
+                ) as response:
+                    body = response.read(_MAX_BODY_BYTES + 1)[:_MAX_BODY_BYTES]
+                    cookies.extend(response.headers.get_all("Set-Cookie") or [])
+                    return HttpPostResult(
+                        status=response.status,
+                        body=body,
+                        set_cookie=tuple(cookies),
+                    )
+            except HTTPError as exc:
+                cookies.extend(exc.headers.get_all("Set-Cookie") or [] if exc.headers else [])
+                if not (300 <= exc.code < 400):
+                    return HttpPostResult(
+                        status=exc.code,
+                        body=exc.read(_MAX_BODY_BYTES + 1)[:_MAX_BODY_BYTES],
+                        set_cookie=tuple(cookies),
+                    )
+                location = exc.headers.get("Location") if exc.headers else None
+                target = resolve_link(current, location) if location else None
+                if target is None:
+                    raise HttpAuthError(
+                        f"redirect {exc.code} de login a Location no navegable"
+                    ) from None
+                if redirects_left <= 0:
+                    raise HttpAuthError(
+                        f"demasiados redirects de login (>{self._config.max_redirects})"
+                    ) from None
+                try:
+                    self._scope.validate_url(target)
+                except (ScopeViolation, SsrfViolation) as scope_exc:
+                    raise HttpAuthError(
+                        f"redirect de login bloqueado -> {target}: {scope_exc}"
+                    ) from None
+                redirects_left -= 1
+                # Tras un 3xx la petición pasa a ser un GET sin cuerpo.
+                current = target
+                method = "GET"
+                payload = None
+                headers = {
+                    k: v for k, v in headers.items() if k.lower() != "content-type"
+                }
+            except SsrfViolation as exc:
+                raise HttpAuthError(f"SSRF bloqueado en login: {exc}") from None
+            except (URLError, TimeoutError, OSError, http.client.HTTPException) as exc:
+                root = getattr(exc, "reason", None)
+                probe = root if isinstance(root, BaseException) else exc
+                detail = _classify_network_error(probe)
+                raise HttpAuthError(f"fallo de red en login: {detail}") from None
+
     # -- internos ------------------------------------------------------------
 
     def _fetch(
@@ -145,7 +245,9 @@ class UrllibHttpClient:
                 self._scope.assert_ip_allowed(host)
 
                 request = Request(  # noqa: S310 - esquema validado en normalize_url
-                    request_url, headers=self._config.headers(), method="GET"
+                    request_url,
+                    headers=self._config.request_headers(),
+                    method="GET",
                 )
                 with self._opener.open(request, timeout=self._config.timeout) as response:
                     body = response.read(_MAX_BODY_BYTES + 1)

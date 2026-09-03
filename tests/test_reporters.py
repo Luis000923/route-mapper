@@ -127,6 +127,18 @@ def test_html_reporter_escapes_script_breakout_payload() -> None:
     assert "\\u003c/script\\u003e" in out
 
 
+def test_html_reporter_renders_node_url_without_innerhtml() -> None:
+    from route_mapper.html_report import _SCRIPT
+
+    # Defensa en profundidad: la URL de un nodo nunca se interpola en innerHTML.
+    assert "tip.innerHTML" not in _SCRIPT
+    assert "urlLine.textContent = n.url" in _SCRIPT
+    # No queda ninguna asignación `innerHTML` que contenga `n.url`.
+    for line in _SCRIPT.splitlines():
+        if "innerHTML" in line:
+            assert "n.url" not in line
+
+
 def test_unknown_format() -> None:
     with pytest.raises(ValueError):
         get_reporter("xml")

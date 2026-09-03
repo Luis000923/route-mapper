@@ -13,6 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from route_mapper import __version__
+from route_mapper.auth import AuthConfig, AuthConfigError, AuthenticationError
 from route_mapper.config import CrawlConfig
 from route_mapper.crawler import Crawler, InvalidStartUrl
 from route_mapper.logging_setup import AUDIT, audit, configure_logging
@@ -44,6 +45,61 @@ def build_parser() -> argparse.ArgumentParser:
                         help="peticiones en paralelo (def. 1)")
     parser.add_argument("--retries", type=int, default=2,
                         help="reintentos ante fallos de red (def. 2)")
+    parser.add_argument("--max-redirects", type=int, default=5,
+                        help="redirecciones máximas por petición (def. 5)")
+    parser.add_argument("--global-timeout", type=float, default=300.0,
+                        help="tiempo máximo total del crawl en segundos (def. 300)")
+    parser.add_argument("--max-links-per-page", type=int, default=1000,
+                        help="enlaces máximos extraídos por página (def. 1000)")
+    parser.add_argument("-H", "--header", action="append", default=None,
+                        metavar="'Nombre: Valor'", dest="header",
+                        help="cabecera HTTP personalizada; repetible "
+                             "(p. ej. -H 'Authorization: Bearer <token>')")
+    auth_group = parser.add_argument_group(
+        "autenticación",
+        "login previo contra un formulario o endpoint API; la sesión obtenida "
+        "se reutiliza en todo el crawl",
+    )
+    auth_group.add_argument("--login-url", default=None,
+                            help="URL del formulario o endpoint de login")
+    auth_group.add_argument("--login-user", default=None,
+                            help="nombre de usuario o correo")
+    auth_group.add_argument("--login-pass", default=None,
+                            help="contraseña (no se registra en logs ni reportes)")
+    auth_group.add_argument("--user-field", default="username",
+                            help="nombre del campo de usuario (def. 'username')")
+    auth_group.add_argument("--pass-field", default="password",
+                            help="nombre del campo de contraseña (def. 'password')")
+    auth_group.add_argument("--auth-type", choices=("form", "json"), default="form",
+                            help="tipo de autenticación (def. form)")
+    auth_group.add_argument("--token-key", default=None,
+                            help="clave del token en la respuesta JSON para "
+                                 "inyectar 'Authorization: Bearer <token>'")
+
+    evasion_group = parser.add_argument_group(
+        "evasión / enrutado",
+        "canalizar el tráfico por un proxy, rotar el User-Agent y difuminar el "
+        "patrón temporal de las peticiones",
+    )
+    evasion_group.add_argument("--proxy", default=None, metavar="URL",
+                               help="proxy http(s):// o socks5(h):// para todo "
+                                    "el tráfico (p. ej. http://127.0.0.1:8080)")
+    evasion_group.add_argument("--ua-file", type=Path, default=None, metavar="RUTA",
+                               help="archivo con User-Agents (uno por línea) para "
+                                    "rotación aleatoria por petición")
+    evasion_group.add_argument("--jitter", type=float, default=0.0, metavar="SEG",
+                               help="variación aleatoria ±SEG sobre la pausa "
+                                    "entre lotes (def. 0)")
+
+    disco_group = parser.add_argument_group("descubrimiento")
+    disco_group.add_argument("--sitemap", action="store_true",
+                             help="sembrar la cola con las URLs de /sitemap.xml")
+    disco_group.add_argument("--parse-js", dest="parse_js", action="store_true",
+                             default=True,
+                             help="extraer endpoints de archivos .js (por defecto)")
+    disco_group.add_argument("--no-parse-js", dest="parse_js", action="store_false",
+                             help="desactivar la minería de endpoints en JavaScript")
+
     parser.add_argument("--include-subdomains", action="store_true",
                         help="seguir enlaces a subdominios del mismo dominio")
     parser.add_argument("--ignore-robots", action="store_true",
@@ -58,6 +114,68 @@ def build_parser() -> argparse.ArgumentParser:
                         help="no mostrar progreso por stderr")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
+
+
+def parse_headers(raw: list[str] | None) -> dict[str, str]:
+    """Convierte ``["Nombre: Valor", ...]`` en un diccionario.
+
+    Lanza :class:`ValueError` si alguna entrada carece del separador ``:``.
+    """
+    headers: dict[str, str] = {}
+    for item in raw or []:
+        name, sep, value = item.partition(":")
+        if not sep or not name.strip():
+            raise ValueError(
+                f"cabecera mal formada: {item!r} "
+                "(se espera el formato 'Nombre: Valor')"
+            )
+        headers[name.strip()] = value.strip()
+    return headers
+
+
+def _build_auth_config(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> AuthConfig | None:
+    """Construye ``AuthConfig`` desde las banderas ``--login-*`` o devuelve ``None``.
+
+    Sale con código 2 (error de uso) si la combinación de banderas es inválida.
+    """
+    if args.login_url is None:
+        if args.login_user is not None or args.login_pass is not None:
+            parser.error("--login-user/--login-pass requieren --login-url")
+        return None
+    if not args.login_user or not args.login_pass:
+        parser.error("--login-url requiere también --login-user y --login-pass")
+    try:
+        return AuthConfig(
+            login_url=args.login_url,
+            username=args.login_user,
+            password=args.login_pass,
+            username_field=args.user_field,
+            password_field=args.pass_field,
+            auth_type=args.auth_type,
+            token_json_key=args.token_key,
+        )
+    except AuthConfigError as exc:
+        parser.error(str(exc))
+
+
+def _load_user_agents(path: Path | None) -> tuple[str, ...]:
+    """Lee un archivo de User-Agents (uno por línea, ignora vacías y ``#``).
+
+    Lanza :class:`ValueError` si la ruta se indicó pero no contiene ninguno.
+    """
+    if path is None:
+        return ()
+    lines = path.read_text(encoding="utf-8").splitlines()
+    agents = tuple(
+        stripped
+        for line in lines
+        if (stripped := line.strip()) and not stripped.startswith("#")
+    )
+    if not agents:
+        raise ValueError(f"--ua-file {path} no contiene ningún User-Agent")
+    return agents
 
 
 def _progress_logger() -> Callable[[PageRecord], None]:
@@ -76,7 +194,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(args.verbose, quiet=args.quiet)
 
+    auth_config = _build_auth_config(parser, args)
+
     try:
+        extra_headers = parse_headers(args.header)
+        user_agents = _load_user_agents(args.ua_file)
         config = CrawlConfig(
             start_url=args.url,
             max_pages=args.max_pages,
@@ -85,10 +207,20 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             concurrency=args.concurrency,
             retries=args.retries,
+            max_redirects=args.max_redirects,
             respect_robots=not args.ignore_robots,
             include_subdomains=args.include_subdomains,
+            max_links_per_page=args.max_links_per_page,
+            global_timeout=args.global_timeout,
+            extra_headers=extra_headers,
+            proxy=args.proxy,
+            user_agents=user_agents,
+            jitter=args.jitter,
+            sitemap=args.sitemap,
+            parse_js=args.parse_js,
+            auth=auth_config,
         )
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         parser.error(str(exc))
         return EXIT_USAGE
 
@@ -99,6 +231,9 @@ def main(argv: list[str] | None = None) -> int:
     except InvalidStartUrl as exc:
         log.error("URL inicial inválida: %s", exc)
         return EXIT_USAGE
+    except AuthenticationError as exc:
+        log.error("autenticación fallida: %s", exc)
+        return EXIT_RUNTIME
     except KeyboardInterrupt:
         log.error("interrumpido por el usuario")
         return EXIT_RUNTIME

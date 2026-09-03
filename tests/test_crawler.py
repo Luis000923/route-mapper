@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from route_mapper.config import CrawlConfig
 from route_mapper.crawler import Crawler
 from route_mapper.models import FetchOutcome, FetchResponse
@@ -215,6 +217,53 @@ def test_queues_never_exceed_max_queued_urls() -> None:
     assert len(set(client.calls)) <= limit
 
 
+class CrawlDelayRobots(RobotsPolicy):
+    """robots.txt que declara ``Crawl-delay`` para todos los hosts."""
+
+    def __init__(self, seconds: float, *, enabled: bool = True) -> None:
+        super().__init__(user_agent="test", enabled=enabled)
+        self._seconds = seconds
+
+    def can_fetch(self, url: str) -> bool:
+        return True
+
+    def crawl_delay(self, url: str) -> float | None:
+        if not self._enabled:
+            return None
+        return self._seconds
+
+
+def test_crawl_delay_from_robots_is_used_as_effective_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("route_mapper.crawler.time.sleep", sleeps.append)
+
+    config = CrawlConfig(start_url="https://example.com", delay=0.2)
+    crawler = Crawler(config, http_client=FakeHttpClient(), robots_policy=CrawlDelayRobots(2))
+    crawler.run()
+
+    assert sleeps  # hubo pausas entre lotes
+    assert all(s == 2 for s in sleeps)  # 2s (robots) gana a 0.2s (config)
+
+
+def test_crawl_delay_ignored_when_ignore_robots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr("route_mapper.crawler.time.sleep", sleeps.append)
+
+    config = CrawlConfig(start_url="https://example.com", delay=0.2)
+    crawler = Crawler(
+        config,
+        http_client=FakeHttpClient(),
+        robots_policy=CrawlDelayRobots(2, enabled=False),
+    )
+    crawler.run()
+
+    assert all(s == pytest.approx(0.2) for s in sleeps)
+
+
 def test_broken_page_marks_nonzero_exit_summary() -> None:
     PAGES["https://example.com/contact"] = b'<a href="/missing">x</a>'
     try:
@@ -223,3 +272,98 @@ def test_broken_page_marks_nonzero_exit_summary() -> None:
         assert any(p.status == 404 for p in result.pages)
     finally:
         PAGES["https://example.com/contact"] = b"<p>no links</p>"
+
+
+# --- Sitemap seeding & JS endpoint mining -----------------------------------
+
+SITEMAP_XML = (
+    b'<?xml version="1.0"?>'
+    b'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+    b"<url><loc>https://example.com/unlinked</loc></url>"
+    b"<url><loc>https://evil.com/out</loc></url>"
+    b"</urlset>"
+)
+
+
+class SitemapHttpClient(FakeHttpClient):
+    def get(self, url: str) -> FetchResponse:
+        self.calls.append(url)
+        if url == "https://example.com/sitemap.xml":
+            return FetchResponse(
+                url=url, outcome=FetchOutcome.OK, status=200,
+                content_type="application/xml", body=SITEMAP_XML,
+            )
+        if url == "https://example.com/unlinked":
+            return FetchResponse(
+                url=url, outcome=FetchOutcome.OK, status=200,
+                content_type="text/html", body=b"<p>secret</p>",
+            )
+        return FetchResponse(
+            url=url, outcome=FetchOutcome.OK, status=200,
+            content_type="text/html", body=b"<p>root</p>",
+        )
+
+
+def test_sitemap_seeds_in_scope_urls_only() -> None:
+    config = CrawlConfig(start_url="https://example.com", delay=0, sitemap=True)
+    client = SitemapHttpClient()
+    crawler = Crawler(config, http_client=client, robots_policy=AllowAllRobots())
+
+    result = crawler.run()
+    urls = {p.url for p in result.pages}
+
+    assert "https://example.com/unlinked" in urls  # descubierta vía sitemap
+    assert all("evil.com" not in u for u in urls)  # fuera de scope, descartada
+    assert "https://example.com/sitemap.xml" in client.calls
+
+
+def test_no_sitemap_request_when_flag_disabled() -> None:
+    config = CrawlConfig(start_url="https://example.com", delay=0)
+    client = SitemapHttpClient()
+    Crawler(config, http_client=client, robots_policy=AllowAllRobots()).run()
+    assert "https://example.com/sitemap.xml" not in client.calls
+
+
+class JsHttpClient(FakeHttpClient):
+    def get(self, url: str) -> FetchResponse:
+        self.calls.append(url)
+        if url == "https://example.com/":
+            return FetchResponse(
+                url=url, outcome=FetchOutcome.OK, status=200,
+                content_type="text/html",
+                body=b'<script src="/app.js"></script>',
+            )
+        if url == "https://example.com/app.js":
+            return FetchResponse(
+                url=url, outcome=FetchOutcome.OK, status=200,
+                content_type="application/javascript",
+                body=b'fetch("/api/v1/secret");const u="/admin/panel";',
+            )
+        return FetchResponse(
+            url=url, outcome=FetchOutcome.OK, status=200,
+            content_type="text/html", body=b"<p>ok</p>",
+        )
+
+
+def test_js_endpoints_are_mined_and_enqueued() -> None:
+    config = CrawlConfig(start_url="https://example.com", delay=0, max_pages=20)
+    client = JsHttpClient()
+    crawler = Crawler(config, http_client=client, robots_policy=AllowAllRobots())
+
+    result = crawler.run()
+    urls = {p.url for p in result.pages}
+
+    assert "https://example.com/api/v1/secret" in urls
+    assert "https://example.com/admin/panel" in urls
+    assert ("https://example.com/app.js", "https://example.com/api/v1/secret") in result.edges
+
+
+def test_js_mining_disabled_by_parse_js_false() -> None:
+    config = CrawlConfig(
+        start_url="https://example.com", delay=0, max_pages=20, parse_js=False
+    )
+    client = JsHttpClient()
+    crawler = Crawler(config, http_client=client, robots_policy=AllowAllRobots())
+
+    urls = {p.url for p in crawler.run().pages}
+    assert "https://example.com/api/v1/secret" not in urls

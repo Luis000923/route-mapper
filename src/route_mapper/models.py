@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+from urllib.parse import urlsplit
 
 
 class FetchOutcome(str, Enum):
@@ -36,6 +37,33 @@ class FetchResponse:
     @property
     def is_html(self) -> bool:
         return "text/html" in self.content_type.lower()
+
+    @property
+    def is_javascript(self) -> bool:
+        """``True`` si la respuesta parece código JavaScript.
+
+        Se basa en el ``Content-Type`` (``application/javascript``,
+        ``text/javascript``...) o, en su defecto, en la extensión ``.js`` del
+        path de la URL.
+        """
+        ctype = self.content_type.lower()
+        if "javascript" in ctype or "ecmascript" in ctype:
+            return True
+        path = urlsplit(self.url).path.lower()
+        return path.endswith(".js")
+
+
+@dataclass(frozen=True, slots=True)
+class HttpPostResult:
+    """Resultado normalizado de un ``POST`` (usado por el flujo de autenticación).
+
+    ``set_cookie`` acumula todas las cabeceras ``Set-Cookie`` vistas a lo largo de
+    la cadena de redirecciones, no solo las de la respuesta final.
+    """
+
+    status: int
+    body: bytes = b""
+    set_cookie: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

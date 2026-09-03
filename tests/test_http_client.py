@@ -14,10 +14,14 @@ from route_mapper.models import FetchOutcome
 from route_mapper.scope import ScopeEngine
 
 
+def _scope(host: str = "example.com") -> ScopeEngine:
+    return ScopeEngine(host, include_subdomains=False)
+
+
 @pytest.mark.parametrize("target", ["127.0.0.1", "169.254.169.254", "10.0.0.1"])
 def test_client_rejects_internal_ip_before_connection(target: str) -> None:
     config = CrawlConfig(start_url="https://example.com", delay=0, retries=0)
-    client = UrllibHttpClient(config)
+    client = UrllibHttpClient(config, scope=_scope())
 
     resp = client.get(f"http://{target}/")
 
@@ -30,7 +34,7 @@ def test_dns_failure_records_specific_detail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = CrawlConfig(start_url="https://example.com", delay=0, retries=0)
-    client = UrllibHttpClient(config)
+    client = UrllibHttpClient(config, scope=_scope())
 
     monkeypatch.setattr(client._scope, "assert_ip_allowed", lambda host: None)
 
@@ -47,7 +51,7 @@ def test_dns_failure_records_specific_detail(
 
 def test_non_ascii_path_is_percent_encoded(monkeypatch: pytest.MonkeyPatch) -> None:
     config = CrawlConfig(start_url="https://example.com", delay=0, retries=0)
-    client = UrllibHttpClient(config)
+    client = UrllibHttpClient(config, scope=_scope())
     monkeypatch.setattr(client._scope, "assert_ip_allowed", lambda host: None)
 
     seen: list[str] = []
@@ -61,6 +65,12 @@ def test_non_ascii_path_is_percent_encoded(monkeypatch: pytest.MonkeyPatch) -> N
     client.get("https://example.com/recursos-didácticos")
 
     assert seen == ["https://example.com/recursos-did%C3%A1cticos"]
+
+
+def test_scope_is_a_required_argument() -> None:
+    config = CrawlConfig(start_url="https://example.com", delay=0, retries=0)
+    with pytest.raises(TypeError):
+        UrllibHttpClient(config)  # type: ignore[call-arg]
 
 
 class _RedirectHandler(BaseHTTPRequestHandler):

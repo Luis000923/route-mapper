@@ -234,9 +234,18 @@ for (const l of DATA.links) {
 }
 
 function hover(n, ev) {
-  tip.innerHTML = `<div>${n.url}</div><div class="s">` +
+  // Defensa en profundidad: la URL nunca se interpola en innerHTML. Se
+  // construye el DOM y se asigna vía textContent (inerte ante markup).
+  tip.textContent = '';
+  const urlLine = document.createElement('div');
+  urlLine.textContent = n.url;
+  const infoLine = document.createElement('div');
+  infoLine.className = 's';
+  infoLine.textContent =
     `${n.status ?? (n.error_detail ?? n.outcome)} · profundidad ${n.depth} · ` +
-    `${n.indeg} entrantes / ${n.outdeg} salientes</div>`;
+    `${n.indeg} entrantes / ${n.outdeg} salientes`;
+  tip.appendChild(urlLine);
+  tip.appendChild(infoLine);
   tip.style.opacity = 1;
   moveTip(ev);
   const nb = neighbors.get(n.id);

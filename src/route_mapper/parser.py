@@ -8,8 +8,11 @@ tocar el crawler.
 from __future__ import annotations
 
 import contextlib
+import re
 from html.parser import HTMLParser
 from urllib.parse import urljoin
+from xml.etree.ElementTree import ParseError
+from xml.etree.ElementTree import fromstring as _xml_fromstring
 
 from route_mapper.url_utils import resolve_link
 
@@ -120,3 +123,71 @@ def extract_links(
             seen.add(resolved)
             links.append(resolved)
     return links
+
+
+# --- Minería de endpoints en JavaScript ------------------------------------
+
+#: Rutas absolutas ("/algo/...") entre comillas simples, dobles o backticks.
+#: Deliberadamente conservador: exige que empiece por una sola barra y que el
+#: primer carácter tras ella sea alfanumérico, descartando expresiones como
+#: "//cdn" (protocol-relative) o operadores de división.
+_JS_ENDPOINT_RE = re.compile(r"""['"`](/[A-Za-z0-9][A-Za-z0-9_./~-]*)['"`]""")
+
+#: Extensiones de recurso estático que no aportan como endpoint de API.
+_JS_NOISE_SUFFIXES = (
+    ".js", ".css", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+    ".woff", ".woff2", ".ttf", ".ico", ".webp",
+)
+
+
+def extract_js_endpoints(content: str) -> set[str]:
+    """Extrae rutas absolutas embebidas como literales de cadena en código JS.
+
+    Puramente léxico (regex): nunca se ejecuta ni se interpreta el JavaScript.
+    Devuelve un conjunto de paths relativos a la raíz (``/api/v1/users``) que el
+    llamador debe resolver contra la URL del recurso y validar contra el scope.
+    """
+    endpoints: set[str] = set()
+    for match in _JS_ENDPOINT_RE.finditer(content):
+        path = match.group(1)
+        if path.lower().endswith(_JS_NOISE_SUFFIXES):
+            continue
+        endpoints.add(path)
+    return endpoints
+
+
+# --- Parsing de Sitemap XML ----------------------------------------------------
+
+
+#: Un Sitemap legítimo (protocolo sitemaps.org) nunca lleva DTD ni entidades.
+#: Su presencia indica un intento de XXE / "billion laughs": se rechaza el doc.
+_XML_DTD_RE = re.compile(r"<!DOCTYPE|<!ENTITY", re.IGNORECASE)
+
+
+def parse_sitemap(xml_content: str) -> list[str]:
+    """Devuelve las URLs declaradas en un Sitemap XML (``<loc>``).
+
+    Soporta tanto ``<urlset>`` como ``<sitemapindex>`` y es agnóstico al espacio
+    de nombres. El parseo está endurecido contra XXE / XML bomb: cualquier DTD o
+    declaración de entidad hace que se devuelva una lista vacía (ElementTree, por
+    su parte, tampoco resuelve entidades externas). XML malformado también
+    devuelve ``[]`` en lugar de propagar.
+    """
+    if _XML_DTD_RE.search(xml_content):
+        return []
+    try:
+        root = _xml_fromstring(xml_content)  # noqa: S314 - DTD/entidades ya rechazadas
+    except (ParseError, ValueError):
+        return []
+
+    locs: list[str] = []
+    seen: set[str] = set()
+    for element in root.iter():
+        tag = element.tag.rsplit("}", 1)[-1]  # descarta "{namespace}"
+        if tag != "loc" or not element.text:
+            continue
+        url = element.text.strip()
+        if url and url not in seen:
+            seen.add(url)
+            locs.append(url)
+    return locs

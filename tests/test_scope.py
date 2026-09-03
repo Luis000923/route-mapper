@@ -17,6 +17,8 @@ from route_mapper.url_utils import is_valid_subdomain
         "169.254.169.254",
         "192.168.1.1",
         "172.16.5.4",
+        "100.64.0.1",  # CGNAT (RFC 6598)
+        "100.127.255.254",  # CGNAT, extremo del rango
         "::1",
         "fe80::1",
         "224.0.0.1",
@@ -30,6 +32,13 @@ def test_is_blocked_ip_rejects_non_public(ip: str) -> None:
 @pytest.mark.parametrize("ip", ["93.184.216.34", "8.8.8.8", "1.1.1.1"])
 def test_is_blocked_ip_allows_public(ip: str) -> None:
     assert not is_blocked_ip(ip)
+
+
+def test_is_blocked_ip_rejects_cgnat_all_python_versions() -> None:
+    # RFC 6598: no lo marca is_private hasta Python 3.13; se comprueba aparte.
+    assert is_blocked_ip("100.64.0.1")
+    assert not is_blocked_ip("100.63.255.255")  # justo fuera del rango
+    assert not is_blocked_ip("100.128.0.0")  # justo fuera del rango
 
 
 @pytest.mark.parametrize(

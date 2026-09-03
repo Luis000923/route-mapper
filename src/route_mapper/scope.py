@@ -24,6 +24,11 @@ from route_mapper.url_utils import is_valid_subdomain
 #: Un resolver traduce un hostname a la lista de IPs (texto) a las que apunta.
 Resolver = Callable[[str], list[str]]
 
+#: Carrier-Grade NAT (RFC 6598). ``ipaddress`` no lo marca como ``is_private``
+#: hasta Python 3.13, así que lo comprobamos explícitamente para todas las
+#: versiones soportadas.
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
 
 class ScopeViolation(Exception):
     """La URL de destino queda fuera del ámbito autorizado del crawl."""
@@ -44,12 +49,15 @@ def is_blocked_ip(ip: str) -> bool:
 
     Cubre loopback (``127.0.0.0/8``, ``::1``), redes privadas (``10/8``,
     ``172.16/12``, ``192.168/16``), link-local (``169.254/16``, ``fe80::/10``),
-    multicast, no especificadas (``0.0.0.0``) y reservadas. Cualquier
+    multicast, CGNAT (``100.64.0.0/10``), no especificadas (``0.0.0.0``) y
+    reservadas. Cualquier
     representación que ``ipaddress`` no sepa parsear se deniega por defecto.
     """
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
+        return True
+    if addr.version == 4 and addr in _CGNAT_NETWORK:
         return True
     return (
         addr.is_private
